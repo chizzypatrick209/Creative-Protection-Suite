@@ -99,6 +99,85 @@
   { license-id: uint, end-time: uint }
 )
 
+;; Private functions - All validation and helper functions defined first
+(define-private (validate-principal (user principal))
+  (not (is-eq user 'ST000000000000000000002AMW42H))) ;; Not null principal
+
+(define-private (validate-recipient (recipient principal))
+  (and (not (is-eq recipient 'ST000000000000000000002AMW42H))
+       (not (is-eq recipient tx-sender)))) ;; Not null and not self
+
+(define-private (validate-moderator-principal (moderator principal))
+  (and (not (is-eq moderator 'ST000000000000000000002AMW42H))
+       (not (is-eq moderator CONTRACT-OWNER)))) ;; Not null and not owner
+
+(define-private (validate-email-hash (email-hash (string-ascii 64)))
+  (and (> (len email-hash) u0) (<= (len email-hash) u64)))
+
+(define-private (validate-description (description (string-utf8 1024)))
+  (and (> (len description) u0) (<= (len description) u1024)))
+
+(define-private (validate-content-id (content-id uint))
+  (and (> content-id u0) (< content-id (var-get next-content-id))))
+
+(define-private (validate-license-id (license-id uint))
+  (and (> license-id u0) (< license-id (var-get next-license-id))))
+
+(define-private (validate-dispute-id (dispute-id uint))
+  (and (> dispute-id u0) (< dispute-id (var-get next-dispute-id))))
+
+(define-private (validate-license-type (license-type (string-ascii 32)))
+  (or (is-eq license-type "commercial") 
+      (is-eq license-type "personal") 
+      (is-eq license-type "educational")))
+
+(define-private (validate-dispute-type (dispute-type (string-ascii 32)))
+  (or (is-eq dispute-type "copyright") 
+      (is-eq dispute-type "plagiarism") 
+      (is-eq dispute-type "misuse")))
+
+(define-private (validate-resolution-status (resolution (string-ascii 16)))
+  (or (is-eq resolution "resolved") 
+      (is-eq resolution "dismissed")))
+
+(define-private (is-valid-moderator (moderator principal))
+  (match (map-get? platform-moderators { moderator: moderator })
+    moderator-data (get is-active moderator-data)
+    false))
+
+(define-private (distribute-royalties (content-id uint) (total-amount uint))
+  (match (get-content-info content-id)
+    content
+    (let ((creator (get creator content))
+          (platform-fee (/ (* total-amount (var-get platform-fee-percentage)) u10000))
+          (creator-amount (- total-amount platform-fee)))
+      ;; Ensure creator-amount is valid
+      (asserts! (>= total-amount platform-fee) ERR-INVALID-AMOUNT)
+      ;; Transfer platform fee to contract owner
+      (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
+      ;; Transfer remaining amount to creator
+      (try! (stx-transfer? creator-amount tx-sender creator))
+      (ok true))
+    ERR-NOT-FOUND))
+
+(define-private (update-user-earnings (user principal) (amount uint))
+  (match (get-user-profile user)
+    profile
+    (map-set user-profiles
+      { user: user }
+      (merge profile { total-earnings: (+ (get total-earnings profile) amount) }))
+    ;; If profile doesn't exist, create basic one
+    (map-set user-profiles
+      { user: user }
+      {
+        display-name: u"Default User",
+        email-hash: "default-hash",
+        is-verified: false,
+        content-count: u0,
+        total-earnings: amount,
+        reputation-score: u100
+      })))
+
 ;; Read-only functions
 (define-read-only (get-content-info (content-id uint))
   (map-get? content-registry { content-id: content-id })
@@ -155,59 +234,6 @@
   CONTRACT-OWNER
 )
 
-;; Private functions
-(define-private (is-valid-moderator (moderator principal))
-  (match (map-get? platform-moderators { moderator: moderator })
-    moderator-data (get is-active moderator-data)
-    false))
-
-(define-private (validate-license-type (license-type (string-ascii 32)))
-  (or (is-eq license-type "commercial") 
-      (is-eq license-type "personal") 
-      (is-eq license-type "educational")))
-
-(define-private (validate-dispute-type (dispute-type (string-ascii 32)))
-  (or (is-eq dispute-type "copyright") 
-      (is-eq dispute-type "plagiarism") 
-      (is-eq dispute-type "misuse")))
-
-(define-private (validate-resolution-status (resolution (string-ascii 16)))
-  (or (is-eq resolution "resolved") 
-      (is-eq resolution "dismissed")))
-
-(define-private (distribute-royalties (content-id uint) (total-amount uint))
-  (match (get-content-info content-id)
-    content
-    (let ((creator (get creator content))
-          (platform-fee (/ (* total-amount (var-get platform-fee-percentage)) u10000))
-          (creator-amount (- total-amount platform-fee)))
-      ;; Ensure creator-amount is valid
-      (asserts! (>= total-amount platform-fee) ERR-INVALID-AMOUNT)
-      ;; Transfer platform fee to contract owner
-      (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
-      ;; Transfer remaining amount to creator
-      (try! (stx-transfer? creator-amount tx-sender creator))
-      (ok true))
-    ERR-NOT-FOUND))
-
-(define-private (update-user-earnings (user principal) (amount uint))
-  (match (get-user-profile user)
-    profile
-    (map-set user-profiles
-      { user: user }
-      (merge profile { total-earnings: (+ (get total-earnings profile) amount) }))
-    ;; If profile doesn't exist, create basic one
-    (map-set user-profiles
-      { user: user }
-      {
-        display-name: u"Default User",
-        email-hash: "default-hash",
-        is-verified: false,
-        content-count: u0,
-        total-earnings: amount,
-        reputation-score: u100
-      })))
-
 ;; Public functions
 
 ;; User Management
@@ -215,6 +241,7 @@
   (let ((user tx-sender))
     (asserts! (is-none (get-user-profile user)) ERR-ALREADY-EXISTS)
     (asserts! (> (len display-name) u0) ERR-INVALID-INPUT)
+    (asserts! (validate-email-hash email-hash) ERR-INVALID-INPUT)
     (map-set user-profiles
       { user: user }
       {
@@ -233,6 +260,7 @@
       profile 
       (begin
         (asserts! (> (len display-name) u0) ERR-INVALID-INPUT)
+        (asserts! (validate-email-hash email-hash) ERR-INVALID-INPUT)
         (map-set user-profiles
           { user: user }
           (merge profile { display-name: display-name, email-hash: email-hash }))
@@ -253,6 +281,7 @@
     (asserts! (> license-price u0) ERR-INVALID-AMOUNT)
     (asserts! (> (len title) u0) ERR-INVALID-INPUT)
     (asserts! (> (len content-hash) u0) ERR-INVALID-INPUT)
+    (asserts! (validate-description description) ERR-INVALID-INPUT)
     
     ;; Register content
     (map-set content-registry
@@ -292,27 +321,31 @@
     (ok content-id)))
 
 (define-public (update-content-status (content-id uint) (is-active bool))
-  (match (get-content-info content-id)
-    content
-    (begin
-      (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
-      (map-set content-registry
-        { content-id: content-id }
-        (merge content { is-active: is-active }))
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
+    (match (get-content-info content-id)
+      content
+      (begin
+        (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
+        (map-set content-registry
+          { content-id: content-id }
+          (merge content { is-active: is-active }))
+        (ok true))
+      ERR-NOT-FOUND)))
 
 (define-public (update-license-price (content-id uint) (new-price uint))
-  (match (get-content-info content-id)
-    content
-    (begin
-      (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
-      (asserts! (> new-price u0) ERR-INVALID-AMOUNT)
-      (map-set content-registry
-        { content-id: content-id }
-        (merge content { license-price: new-price }))
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
+    (asserts! (> new-price u0) ERR-INVALID-AMOUNT)
+    (match (get-content-info content-id)
+      content
+      (begin
+        (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
+        (map-set content-registry
+          { content-id: content-id }
+          (merge content { license-price: new-price }))
+        (ok true))
+      ERR-NOT-FOUND)))
 
 ;; License Management
 (define-public (purchase-license 
@@ -324,6 +357,7 @@
         (current-time stacks-block-height)
         (license-fee (unwrap! (calculate-license-fee content-id license-type) ERR-INVALID-LICENSE-TYPE)))
     
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
     (asserts! (get is-active content) ERR-CONTENT-NOT-ACTIVE)
     (asserts! (>= duration (var-get min-license-duration)) ERR-INVALID-DURATION)
     (asserts! (<= duration (var-get max-license-duration)) ERR-INVALID-DURATION)
@@ -367,16 +401,18 @@
     (ok license-id)))
 
 (define-public (revoke-license (license-id uint))
-  (match (get-license-info license-id)
-    license
-    (let ((content (unwrap! (get-content-info (get content-id license)) ERR-NOT-FOUND)))
-      (asserts! (or (is-eq (get creator content) tx-sender) 
-                    (is-eq (get licensee license) tx-sender)) ERR-UNAUTHORIZED-ACCESS)
-      (map-set content-licenses
-        { license-id: license-id }
-        (merge license { is-active: false }))
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-license-id license-id) ERR-INVALID-INPUT)
+    (match (get-license-info license-id)
+      license
+      (let ((content (unwrap! (get-content-info (get content-id license)) ERR-NOT-FOUND)))
+        (asserts! (or (is-eq (get creator content) tx-sender) 
+                      (is-eq (get licensee license) tx-sender)) ERR-UNAUTHORIZED-ACCESS)
+        (map-set content-licenses
+          { license-id: license-id }
+          (merge license { is-active: false }))
+        (ok true))
+      ERR-NOT-FOUND)))
 
 ;; Dispute Management
 (define-public (file-dispute 
@@ -386,9 +422,10 @@
     (description (string-utf8 512)))
   (let ((dispute-id (var-get next-dispute-id))
         (current-time stacks-block-height))
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
     (asserts! (is-some (get-content-info content-id)) ERR-NOT-FOUND)
     (asserts! (validate-dispute-type dispute-type) ERR-INVALID-DISPUTE-STATUS)
-    (asserts! (> (len description) u0) ERR-INVALID-INPUT)
+    (asserts! (validate-description description) ERR-INVALID-INPUT)
     (asserts! (not (is-eq tx-sender respondent)) ERR-INVALID-INPUT) ;; Can't dispute against yourself
     
     (map-set content-disputes
@@ -409,46 +446,54 @@
     (ok dispute-id)))
 
 (define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 16)))
-  (match (get-dispute-info dispute-id)
-    dispute
-    (let ((current-time stacks-block-height))
-      (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-valid-moderator tx-sender)) ERR-UNAUTHORIZED-ACCESS)
-      (asserts! (is-eq (get status dispute) "open") ERR-INVALID-DISPUTE-STATUS)
-      (asserts! (validate-resolution-status resolution) ERR-INVALID-DISPUTE-STATUS)
-      
-      (map-set content-disputes
-        { dispute-id: dispute-id }
-        (merge dispute {
-          status: resolution,
-          resolved-at: (some current-time),
-          resolver: (some tx-sender)
-        }))
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-dispute-id dispute-id) ERR-INVALID-INPUT)
+    (match (get-dispute-info dispute-id)
+      dispute
+      (let ((current-time stacks-block-height))
+        (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-valid-moderator tx-sender)) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-eq (get status dispute) "open") ERR-INVALID-DISPUTE-STATUS)
+        (asserts! (validate-resolution-status resolution) ERR-INVALID-DISPUTE-STATUS)
+        
+        (map-set content-disputes
+          { dispute-id: dispute-id }
+          (merge dispute {
+            status: resolution,
+            resolved-at: (some current-time),
+            resolver: (some tx-sender)
+          }))
+        (ok true))
+      ERR-NOT-FOUND)))
 
 ;; Royalty Management
 (define-public (add-royalty-split (content-id uint) (recipient principal) (percentage uint))
-  (match (get-content-info content-id)
-    content
-    (begin
-      (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
-      (asserts! (<= percentage u10000) ERR-INVALID-PERCENTAGE) ;; Max 100%
-      (asserts! (> percentage u0) ERR-INVALID-PERCENTAGE) ;; Must be > 0%
-      
-      (map-set royalty-splits
-        { content-id: content-id, recipient: recipient }
-        { percentage: percentage })
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
+    (asserts! (validate-recipient recipient) ERR-INVALID-INPUT)
+    (match (get-content-info content-id)
+      content
+      (begin
+        (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (<= percentage u10000) ERR-INVALID-PERCENTAGE) ;; Max 100%
+        (asserts! (> percentage u0) ERR-INVALID-PERCENTAGE) ;; Must be > 0%
+        
+        (map-set royalty-splits
+          { content-id: content-id, recipient: recipient }
+          { percentage: percentage })
+        (ok true))
+      ERR-NOT-FOUND)))
 
 (define-public (remove-royalty-split (content-id uint) (recipient principal))
-  (match (get-content-info content-id)
-    content
-    (begin
-      (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
-      (map-delete royalty-splits { content-id: content-id, recipient: recipient })
-      (ok true))
-    ERR-NOT-FOUND))
+  (begin
+    (asserts! (validate-content-id content-id) ERR-INVALID-INPUT)
+    (asserts! (validate-principal recipient) ERR-INVALID-INPUT)
+    (match (get-content-info content-id)
+      content
+      (begin
+        (asserts! (is-eq (get creator content) tx-sender) ERR-UNAUTHORIZED-ACCESS)
+        (map-delete royalty-splits { content-id: content-id, recipient: recipient })
+        (ok true))
+      ERR-NOT-FOUND)))
 
 ;; Admin functions
 (define-public (add-moderator (moderator principal))
@@ -463,6 +508,7 @@
 (define-public (remove-moderator (moderator principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (validate-principal moderator) ERR-INVALID-INPUT)
     (match (map-get? platform-moderators { moderator: moderator })
       moderator-data
       (begin
@@ -482,6 +528,7 @@
 (define-public (verify-user (user principal))
   (begin
     (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-valid-moderator tx-sender)) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (validate-principal user) ERR-INVALID-INPUT)
     (match (get-user-profile user)
       profile
       (begin
